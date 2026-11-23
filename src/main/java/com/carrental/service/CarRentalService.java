@@ -7,6 +7,7 @@ import com.carrental.domain.Reservation;
 import com.carrental.domain.ReservationPeriod;
 import com.carrental.domain.ReservationResult;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.EnumMap;
@@ -27,9 +28,15 @@ public final class CarRentalService {
     public static final Duration START_GRACE = Duration.ofMinutes(5);
 
     private final Map<CarType, CarTypeInventory> inventories = new EnumMap<>(CarType.class);
+    private final Clock clock;
 
     public CarRentalService(FleetConfig fleetConfig) {
+        this(fleetConfig, Clock.systemUTC());
+    }
+
+    public CarRentalService(FleetConfig fleetConfig, Clock clock) {
         Objects.requireNonNull(fleetConfig, "FleetConfig must not be null");
+        this.clock = Objects.requireNonNull(clock, "Clock must not be null");
         for (CarType type : CarType.values()) {
             inventories.put(type, new CarTypeInventory(type, fleetConfig.capacityOf(type)));
         }
@@ -69,7 +76,7 @@ public final class CarRentalService {
      */
     public CancellationResult cancel(UUID reservationId) {
         Objects.requireNonNull(reservationId, "Reservation id must not be null");
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         for (CarTypeInventory inventory : inventories.values()) {
             CancellationResult result = inventory.cancel(reservationId, now);
             if (!(result instanceof CancellationResult.NotFound)) {
@@ -95,7 +102,7 @@ public final class CarRentalService {
 
     private ReservationPeriod effectivePeriod(Instant start, int days) {
         Objects.requireNonNull(start, "Start instant must not be null");
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         if (start.isBefore(now.minus(START_GRACE))) {
             throw new IllegalArgumentException("Start %s is in the past (now=%s)".formatted(start, now));
         }
