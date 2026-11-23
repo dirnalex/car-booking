@@ -16,13 +16,18 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CarRentalServiceTest {
 
@@ -255,6 +260,184 @@ class CarRentalServiceTest {
             assertEquals(0, service.availableCount(CarType.SUV, day(1), 2));
             assertEquals(0, service.availableCount(CarType.SEDAN, day(1), 2));
             assertEquals(Optional.of(sedan), service.findReservation(sedan.id()));
+        }
+    }
+
+    @Nested
+    @DisplayName("Cancellation")
+    class CancellationTests {
+
+        @Test
+        void cancellingFutureReservationFreesItsCar() {
+            CarRentalService service = new CarRentalService(FleetConfig.of(1, 0, 0), FIXED_CLOCK);
+
+            Reservation original = assertConfirmed(service.reserve(CarType.SEDAN, day(1), 4));
+            assertUnavailable(service.reserve(CarType.SEDAN, day(2), 2));
+
+            CancellationResult cancelResult = service.cancel(original.id());
+            CancellationResult.Cancelled cancelled =
+                    assertInstanceOf(CancellationResult.Cancelled.class, cancelResult);
+
+            assertEquals(original, cancelled.reservation());
+            assertTrue(service.findReservation(original.id()).isEmpty());
+            assertEquals(1, service.availableCount(CarType.SEDAN, day(1), 4));
+
+            // Same and overlapping periods are bookable again
+            Reservation rebooked = assertConfirmed(service.reserve(CarType.SEDAN, day(2), 2));
+            assertEquals(Optional.of(rebooked), service.findReservation(rebooked.id()));
+        }
+
+        @Test
+        void cancellingUnknownOrAlreadyCancelledIdReturnsNotFound() {
+            CarRentalService service = new CarRentalService(FleetConfig.of(1, 0, 0), FIXED_CLOCK);
+            UUID unknownId = UUID.randomUUID();
+
+            CancellationResult unknownResult = service.cancel(unknownId);
+            assertEquals(new CancellationResult.NotFound(unknownId), unknownResult);
+
+            Reservation booked = assertConfirmed(service.reserve(CarType.SEDAN, day(1), 2));
+            assertInstanceOf(CancellationResult.Cancelled.class, service.cancel(booked.id()));
+
+            // Second cancel is idempotent and does not corrupt capacity deltas
+            assertEquals(new CancellationResult.NotFound(booked.id()), service.cancel(booked.id()));
+            assertEquals(1, service.availableCount(CarType.SEDAN, day(1), 2));
+            // A double-applied reversal would push occupancy to -1 and report 2 free cars
+            assertConfirmed(service.reserve(CarType.SEDAN, day(1), 2));
+            assertEquals(0, service.availableCount(CarType.SEDAN, day(1), 2));
+        }
+
+        @Test
+        void cancellingAtOrAfterStartReturnsAlreadyStartedAndKeepsTheCarBooked() {
+            MutableClock clock = new MutableClock(NOW);
+            CarRentalService service = new CarRentalService(FleetConfig.of(1, 0, 0), clock);
+            Reservation booked = assertConfirmed(service.reserve(CarType.SEDAN, day(1), 4)); // [1, 5)
+
+            clock.advance(Duration.ofDays(1)); // now == start: the rental has begun
+            assertEquals(new CancellationResult.AlreadyStarted(booked), service.cancel(booked.id()));
+
+            clock.advance(Duration.ofDays(1)); // now = day 2, rental in progress
+            assertEquals(new CancellationResult.AlreadyStarted(booked), service.cancel(booked.id()));
+            assertEquals(Optional.of(booked), service.findReservation(booked.id()));
+            assertUnavailable(service.reserve(CarType.SEDAN, day(3), 1));
+        }
+    }
+
+    @Nested
+    @DisplayName("Reservations over time")
+    class LifecycleTests {
+
+        @Test
+        void completedReservationIsStillFindableButCannotBeCancelled() {
+            MutableClock clock = new MutableClock(NOW);
+            CarRentalService service = new CarRentalService(FleetConfig.of(1, 0, 0), clock);
+            Reservation finished = assertConfirmed(service.reserve(CarType.SEDAN, day(0), 2)); // [0, 2)
+            Reservation ongoing = assertConfirmed(service.reserve(CarType.SEDAN, day(2), 3)); // [2, 5)
+
+            clock.advance(Duration.ofDays(3)); // now = day 3
+
+            assertEquals(Optional.of(finished), service.findReservation(finished.id()));
+            assertEquals(new CancellationResult.AlreadyStarted(finished), service.cancel(finished.id()));
+            // The ongoing rental still holds the only car until day 5
+            assertEquals(Optional.of(ongoing), service.findReservation(ongoing.id()));
+            assertEquals(0, service.availableCount(CarType.SEDAN, day(3), 1));
+            assertEquals(1, service.availableCount(CarType.SEDAN, day(5), 1));
+        }
+
+        @Test
+        void longRunningServiceKeepsCorrectCapacityWeekAfterWeek() {
+            MutableClock clock = new MutableClock(NOW);
+            CarRentalService service = new CarRentalService(FleetConfig.of(2, 0, 0), clock);
+
+            for (int week = 0; week < 200; week++) {
+                Instant start = clock.instant();
+                assertConfirmed(service.reserve(CarType.SEDAN, start, 3));
+                assertConfirmed(service.reserve(CarType.SEDAN, start.plus(Duration.ofDays(1)), 3));
+                clock.advance(Duration.ofDays(2)); // inside both rentals
+                assertEquals(0, service.availableCount(CarType.SEDAN, clock.instant(), 1));
+                clock.advance(Duration.ofDays(5)); // both finished
+                assertEquals(2, service.availableCount(CarType.SEDAN, clock.instant(), 7));
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("Randomized comparison with an independent brute-force model")
+    class ReferenceModelTests {
+
+        @ParameterizedTest
+        @ValueSource(longs = {1, 2, 3, 42, 2026})
+        void reserveCancelAndAvailabilityMatchBruteForceModel(long seed) {
+            Random random = new Random(seed);
+            int capacity = 1 + random.nextInt(3);
+            CarRentalService service = new CarRentalService(FleetConfig.of(capacity, 0, 0), FIXED_CLOCK);
+            List<Reservation> model = new ArrayList<>();
+
+            for (int op = 0; op < 2_000; op++) {
+                String context = "seed=%d op=%d".formatted(seed, op);
+                if (!model.isEmpty() && random.nextInt(4) == 0) {
+                    Reservation victim = model.remove(random.nextInt(model.size()));
+                    assertInstanceOf(CancellationResult.Cancelled.class, service.cancel(victim.id()), context);
+                    continue;
+                }
+
+                // Starts at least an hour ahead: with the fixed clock, a booking starting at NOW has
+                // already started and could not be cancelled.
+                Instant start = NOW.plus(Duration.ofHours(1 + random.nextInt(24 * 30)));
+                int days = 1 + random.nextInt(5);
+                ReservationPeriod candidate = ReservationPeriod.ofDays(start, days);
+                List<ReservationPeriod> booked = model.stream().map(Reservation::period).toList();
+                int expectedPeak = BruteForceOccupancy.peakWithin(booked, candidate);
+
+                assertEquals(capacity - Math.min(capacity, expectedPeak),
+                        service.availableCount(CarType.SEDAN, start, days), context);
+                ReservationResult result = service.reserve(CarType.SEDAN, start, days);
+                assertEquals(expectedPeak < capacity, result instanceof ReservationResult.Confirmed, context);
+                if (result instanceof ReservationResult.Confirmed confirmed) {
+                    model.add(confirmed.reservation());
+                }
+            }
+        }
+    }
+
+    @Nested
+    @DisplayName("Time rules: grace window, no upper limits")
+    class TimeRuleTests {
+
+        @Test
+        void startInsideGraceWindowIsConfirmedAndMovedToNow() {
+            CarRentalService service = new CarRentalService(FleetConfig.of(2, 0, 0), FIXED_CLOCK);
+            Instant thirtySecondsAgo = NOW.minusSeconds(30);
+
+            Reservation reservation = assertConfirmed(service.reserve(CarType.SEDAN, thirtySecondsAgo, 2));
+
+            assertEquals(new ReservationPeriod(NOW, thirtySecondsAgo.plus(Duration.ofDays(2))),
+                    reservation.period());
+            assertEquals(1, service.availableCount(CarType.SEDAN, thirtySecondsAgo, 2));
+            assertConfirmed(service.reserve(CarType.SEDAN, NOW.minus(CarRentalService.START_GRACE), 1));
+        }
+
+        @Test
+        void rejectsStartBeforeGraceWindow() {
+            CarRentalService service = new CarRentalService(FleetConfig.of(2, 2, 2), FIXED_CLOCK);
+            Instant justTooEarly = NOW.minus(CarRentalService.START_GRACE).minusNanos(1);
+
+            assertThrows(IllegalArgumentException.class, () -> service.reserve(CarType.SEDAN, justTooEarly, 1));
+            assertThrows(IllegalArgumentException.class,
+                    () -> service.availableCount(CarType.SEDAN, justTooEarly, 1));
+            assertThrows(IllegalArgumentException.class,
+                    () -> service.reserve(CarType.SEDAN, NOW.minus(Duration.ofDays(1)), 2));
+        }
+
+        @Test
+        void acceptsAnyLengthAndStartUntilTheEndOverflows() {
+            CarRentalService service = new CarRentalService(FleetConfig.of(1, 0, 0), FIXED_CLOCK);
+
+            Reservation longest = assertConfirmed(service.reserve(CarType.SEDAN, day(1), Integer.MAX_VALUE));
+            assertEquals(day(1).plus(Duration.ofDays(Integer.MAX_VALUE)), longest.period().end());
+            assertUnavailable(service.reserve(CarType.SEDAN, day(100_000), 1));
+
+            assertThrows(IllegalArgumentException.class,
+                    () -> service.reserve(CarType.SEDAN, Instant.MAX.minusSeconds(60), 1));
         }
     }
 
