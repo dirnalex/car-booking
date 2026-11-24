@@ -61,7 +61,7 @@ final class CarTypeInventory {
             if (reservation == null) {
                 return new CancellationResult.NotFound(reservationId);
             }
-            if (now.isAfter(reservation.period().start())) {
+            if (!now.isBefore(reservation.period().start())) {
                 return new CancellationResult.AlreadyStarted(reservation);
             }
             reservations.remove(reservationId);

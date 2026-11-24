@@ -1,7 +1,9 @@
 package com.carrental.service;
 
+import com.carrental.domain.CancellationResult;
 import com.carrental.domain.CarType;
 import com.carrental.domain.FleetConfig;
+import com.carrental.domain.Reservation;
 import com.carrental.domain.ReservationPeriod;
 import com.carrental.domain.ReservationResult;
 import org.junit.jupiter.api.DisplayName;
@@ -12,7 +14,11 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -23,6 +29,7 @@ import java.util.function.IntUnaryOperator;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -113,6 +120,111 @@ class CarRentalConcurrencyTest {
             assertEquals(capacity - BruteForceOccupancy.occupancyAt(confirmed, point),
                     service.availableCount(CarType.SUV, point, 1), "day " + d);
         }
+    }
+
+    @Test
+    @DisplayName("Concurrent reserve, cancel, availableCount and find keep the fleet within capacity")
+    void mixedOperationsKeepTheFleetWithinCapacity() throws Exception {
+        int capacity = 3;
+        CarRentalService service = new CarRentalService(FleetConfig.of(capacity, 0, 0), FIXED_CLOCK);
+
+        // Fill days 1-4 completely: new bookings there only fit once the cancels release cars
+        List<Reservation> toCancel = new ArrayList<>();
+        for (int i = 0; i < capacity; i++) {
+            toCancel.add(assertInstanceOf(ReservationResult.Confirmed.class,
+                    service.reserve(CarType.SEDAN, day(1), 3)).reservation());
+        }
+
+        List<Callable<Object>> tasks = new ArrayList<>();
+        for (Reservation reservation : toCancel) {
+            tasks.add(() -> service.cancel(reservation.id()));
+            tasks.add(() -> service.findReservation(reservation.id()));
+        }
+        for (int i = 0; i < 40; i++) {
+            Instant start = day(1 + i % 5);
+            int days = 1 + i % 3;
+            tasks.add(() -> service.reserve(CarType.SEDAN, start, days));
+            tasks.add(() -> service.availableCount(CarType.SEDAN, start, days));
+        }
+
+        List<ReservationPeriod> confirmed = new ArrayList<>();
+        for (Object result : runSimultaneously(tasks)) {
+            switch (result) {
+                case ReservationResult.Confirmed c -> confirmed.add(c.reservation().period());
+                case CancellationResult c -> assertInstanceOf(CancellationResult.Cancelled.class, c);
+                case Integer available -> assertTrue(available >= 0 && available <= capacity, "available " + available);
+                case Optional<?> found -> found.ifPresent(r -> assertTrue(toCancel.contains(r)));
+                default -> { } // Unavailable
+            }
+        }
+
+        // Every pre-booked reservation is gone; what remains is exactly what the reserve calls confirmed
+        assertTrue(BruteForceOccupancy.peakWithin(confirmed, WHOLE_HORIZON) <= capacity);
+        for (Reservation reservation : toCancel) {
+            assertTrue(service.findReservation(reservation.id()).isEmpty());
+        }
+        for (int d = 0; d < 8; d++) {
+            ReservationPeriod oneDay = ReservationPeriod.ofDays(day(d), 1);
+            assertEquals(capacity - BruteForceOccupancy.peakWithin(confirmed, oneDay),
+                    service.availableCount(CarType.SEDAN, day(d), 1), "day " + d);
+        }
+    }
+
+    @Test
+    @DisplayName("20 concurrent cancellations for the same reservation succeed exactly once")
+    void concurrentCancellationOfSameReservationIsIdempotentAndSafe() throws Exception {
+        int threads = 20;
+        CarRentalService service = new CarRentalService(FleetConfig.of(1, 0, 0), FIXED_CLOCK);
+
+        Reservation booked = assertInstanceOf(
+                ReservationResult.Confirmed.class,
+                service.reserve(CarType.SEDAN, day(1), 3)).reservation();
+        UUID id = booked.id();
+
+        List<Callable<CancellationResult>> tasks = new ArrayList<>(threads);
+        for (int i = 0; i < threads; i++) {
+            tasks.add(() -> service.cancel(id));
+        }
+
+        int cancelledCount = 0;
+        int notFoundCount = 0;
+        for (CancellationResult result : runSimultaneously(tasks)) {
+            switch (result) {
+                case CancellationResult.Cancelled ignored -> cancelledCount++;
+                case CancellationResult.NotFound ignored -> notFoundCount++;
+                case CancellationResult.AlreadyStarted ignored -> throw new AssertionError("starts on day 1");
+            }
+        }
+
+        assertEquals(1, cancelledCount);
+        assertEquals(threads - 1, notFoundCount);
+        // Exactly one car free again: a double reversal would not show here, so book it and re-check
+        assertEquals(1, service.availableCount(CarType.SEDAN, day(1), 3));
+        assertInstanceOf(ReservationResult.Confirmed.class, service.reserve(CarType.SEDAN, day(1), 3));
+        assertEquals(0, service.availableCount(CarType.SEDAN, day(1), 3));
+    }
+
+    @Test
+    @DisplayName("Parallel reservations across SEDAN, SUV, and VAN honor independent capacities")
+    void parallelCrossTypeReservationsRespectIndependentCapacities() throws Exception {
+        int threadsPerType = 20;
+        CarRentalService service = new CarRentalService(FleetConfig.of(3, 4, 2), FIXED_CLOCK);
+
+        List<Callable<ReservationResult>> tasks = new ArrayList<>();
+        for (CarType type : CarType.values()) {
+            for (int i = 0; i < threadsPerType; i++) {
+                tasks.add(() -> service.reserve(type, day(2), 2));
+            }
+        }
+
+        Map<CarType, Integer> confirmedByType = new EnumMap<>(CarType.class);
+        for (ReservationResult result : runSimultaneously(tasks)) {
+            if (result instanceof ReservationResult.Confirmed c) {
+                confirmedByType.merge(c.reservation().carType(), 1, Integer::sum);
+            }
+        }
+
+        assertEquals(Map.of(CarType.SEDAN, 3, CarType.SUV, 4, CarType.VAN, 2), confirmedByType);
     }
 
     /**
