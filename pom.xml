@@ -10,7 +10,7 @@
     <packaging>jar</packaging>
 
     <name>Simulated Car Rental System</name>
-    <description>In-memory simulated car rental system.</description>
+    <description>In-memory object-oriented simulated car rental system using sweep-line capacity scheduling and per-type lock striping.</description>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
